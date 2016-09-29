@@ -10,7 +10,9 @@
   able to play the new device."
   (:gen-class)
   (:require [clojure.string :as string]
-            [clojure.core.match :refer [match]]))
+            [clojure.core.match :refer [match]]
+            [net.tcp.server :as tcp]
+            [clojure.pprint :as pp]))
 
 ;; To learn the Java MIDI API, start here:
 ;; https://docs.oracle.com/javase/tutorial/sound/overview-MIDI.html
@@ -45,35 +47,33 @@
     [0x90 pitch velocity] ((if (= 0 velocity) note-off note-on) pitch)
     :else (println "Got MIDI message" status)))
 
-(def our-receiver
-  (reify javax.sound.midi.Receiver
-    (close [this]
-      (println "Receiver closed"))
-    (send [this msg timestamp]
-      (try
-        (handle-midi-message
-         ;; TODO: Should we mask out MIDI channel from status?
-         (.getStatus msg)
-         ;; TODO: Is it safe to call these for all messages?
-         (.getData1 msg) (.getData2 msg))
-        (catch Exception e
-          ;; We need to have this exception handler here. Otherwise
-          ;; exceptions thrown in this method (in case there's a bug
-          ;; in the above code) are muffled, execution of the method
-          ;; stops and the program continues. This probably happens
-          ;; because the method is run in a different thread from the
-          ;; main thread, and apparently "In the JVM, when an
-          ;; exception is thrown on a thread other than the main
-          ;; thread, and nothing is there to catch it, nothing
-          ;; happens. The thread dies silently." See:
-          ;; https://stuartsierra.com/2015/05/27/clojure-uncaught-exceptions
-          (println (str "exception: " (.getMessage e))))))))
+(defn bytes-from [input-stream]
+  (lazy-seq
+   (let [byte (.read input-stream)]
+     (when-not (= -1 byte) (cons byte (bytes-from input-stream))))))
+
+(defn midi-data-byte? [byte]
+  (not (bit-test byte 7)))
+
+(defn midi-messages-from [bytes]
+  (lazy-seq
+   (let [[_ bytes] (split-with midi-data-byte? bytes)]
+     (when (seq bytes)
+       (let [[[command] bytes] (split-at 1 bytes)]
+         (let [[data bytes] (split-with midi-data-byte? bytes)]
+           (let [msg (vec (cons command data))]
+             (cons msg (midi-messages-from bytes)))))))))
+
+(defn handler [input-stream output-stream]
+  (println "Hello client!")
+  (binding [pp/*print-base* 16]
+    (doseq [msg (midi-messages-from (bytes-from input-stream))]
+      (pp/pprint msg)
+      (apply handle-midi-message msg)
+      (flush))))
 
 (defn -main []
-  (println "Hello MIDI!")
-  (println "Getting default transmitter")
-  (let [transmitter (javax.sound.midi.MidiSystem/getTransmitter)]
-    (println "Default transmitter =" transmitter)
-    (println "Plugging our receiver into"
-             "the default transmitter and listening")
-    (.setReceiver transmitter our-receiver)))
+  (let [server (tcp/tcp-server :host "0.0.0.0" :port 12345
+                               :handler (tcp/wrap-streams handler))]
+    (println "Starting TCP server")
+    (tcp/start server)))
